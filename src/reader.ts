@@ -6,6 +6,11 @@ import { assertPublicHttpUrl } from "./security.js";
 
 export type RenderMode = "never" | "fallback" | "always";
 
+export interface BasicAuth {
+  username: string;
+  password: string;
+}
+
 export interface ReadPageResult {
   url: string;
   finalUrl?: string;
@@ -107,13 +112,20 @@ async function readLimitedBody(response: Response, limit: number): Promise<strin
   return text + decoder.decode();
 }
 
-async function fetchHtml(rawUrl: string, config: Config): Promise<{
+async function fetchHtml(rawUrl: string, config: Config, basicAuth?: BasicAuth): Promise<{
   html: string;
   finalUrl: string;
   status: number;
   contentType: string;
 }> {
   let url = await assertPublicHttpUrl(rawUrl);
+  if (basicAuth && url.protocol !== "https:") {
+    throw new Error("Basic Auth requires an HTTPS URL");
+  }
+  const authenticatedOrigin = basicAuth ? url.origin : undefined;
+  const authorization = basicAuth
+    ? `Basic ${Buffer.from(`${basicAuth.username}:${basicAuth.password}`, "utf8").toString("base64")}`
+    : undefined;
   for (let redirects = 0; redirects <= 5; redirects += 1) {
     const response = await fetch(url, {
       redirect: "manual",
@@ -122,6 +134,7 @@ async function fetchHtml(rawUrl: string, config: Config): Promise<{
         "User-Agent": config.userAgent,
         "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
         "Accept-Language": "ru,en;q=0.7",
+        ...(authorization && url.origin === authenticatedOrigin ? { Authorization: authorization } : {}),
       },
     });
     if (response.status >= 300 && response.status < 400) {
@@ -178,8 +191,12 @@ export async function readPage(
   render: RenderMode,
   startCharacter: number,
   maxCharacters: number,
+  basicAuth?: BasicAuth,
 ): Promise<ReadPageResult> {
   try {
+    if (basicAuth && render === "always") {
+      throw new Error("Basic Auth is supported only by HTTP fetching; render=always is not allowed");
+    }
     let loaded: Awaited<ReturnType<typeof fetchHtml>> | Awaited<ReturnType<typeof renderHtml>>;
     let fetchMode: "http" | "browser";
     if (render === "always") {
@@ -187,14 +204,14 @@ export async function readPage(
       fetchMode = "browser";
     } else {
       try {
-        loaded = await fetchHtml(rawUrl, config);
+        loaded = await fetchHtml(rawUrl, config, basicAuth);
         fetchMode = "http";
-        if (render === "fallback" && extractArticle(loaded.html, loaded.finalUrl).text.length < 1_000) {
+        if (!basicAuth && render === "fallback" && extractArticle(loaded.html, loaded.finalUrl).text.length < 1_000) {
           loaded = await renderHtml(rawUrl, browser, config);
           fetchMode = "browser";
         }
       } catch (httpError) {
-        if (render !== "fallback" || httpError instanceof PageTooLargeError) throw httpError;
+        if (basicAuth || render !== "fallback" || httpError instanceof PageTooLargeError) throw httpError;
         loaded = await renderHtml(rawUrl, browser, config);
         fetchMode = "browser";
       }
